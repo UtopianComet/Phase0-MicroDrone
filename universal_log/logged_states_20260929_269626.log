@@ -1,5 +1,0 @@
-[2026-09-29T10:00:00.000Z] IDLE: {"reason":"waiting for mission"}
-[2026-09-29T10:00:05.000Z] TRACKING: {"position_m":{"x":1.25,"y":-0.4,"z":2.0},"battery_percent":92}
-[2026-09-29T10:00:10.000Z] DOCKING_APPROACH: {"pad_distance_m":0.8,"alignment_error_m":0.12}
-[2026-09-29T10:00:15.000Z] ABORT: {"reason":"test abort","source":"test fixture"}
-[2026-09-29T10:00:20.000Z] NOT_A_REAL_STATE: {"reason":"verify unknown-state error level"}
