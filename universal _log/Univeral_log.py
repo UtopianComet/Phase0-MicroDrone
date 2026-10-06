@@ -38,7 +38,7 @@ class UniversalLog:
         logger.propagate = False
         formatter = logging.Formatter("%(message)s")
         if not any(isinstance(handler, logging.FileHandler) for handler in logger.handlers):
-            run_id = datetime.now().strftime("%Y%m%d_%f")
+            run_id = datetime.now().strftime("%Y / %m / %d_%f")
             file_handler = logging.FileHandler(
                 Path(__file__).with_name(f"logged_states_{run_id}.log"),
                 mode="x",
