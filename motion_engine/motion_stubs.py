@@ -1,8 +1,8 @@
 """MotionStub -- the kinematic motion stand-in for the Phase-0 mission layer.
 
 Phase-0 has no flight controller, no motors and no simulator in the mission
-loop. What the mission state machine (`mission/state_machine.py`) needs from
-"motion" is much smaller than a flight stack: it needs to *issue* a command
+loop. What the central coordinator (`state_machine/`, see
+INTEGRATION_README.md) needs from "motion" is much smaller than a flight stack: it needs to *issue* a command
 ("go to X, Y, Z", "hover", "land on the dock") and then *observe progress over
 time* -- the drone is 12 m away from the approach point, then 7 m, then it has
 arrived -- so that transitions such as DOCKING_APPROACH -> DOCKED happen for a
@@ -13,6 +13,18 @@ So this module is a pure kinematic stub: it holds a synthetic `Pose` and each
 mass, no drag, no attitude dynamics, no PID. That is deliberate -- the point is
 to exercise the *decision* layer, and a kinematic model is predictable enough
 that tests can say "at 5 m/s, 20 m takes 4 s" and mean it.
+
+Two ways in:
+
+* `submit(command, now_ns)` / `feedback(now_ns)` / `step(dt, now_ns)` -- the
+  shared contract from INTEGRATION_README.md §3-§4. The coordinator sends a
+  `contracts.Command`, gets a `CommandAck` back immediately, advances Motion
+  exactly once per tick, and reads `VehicleFeedback`. Commands carry an ID
+  and an expiry; an expired target is replaced by a hold *before* the next
+  movement step, so a stale target can never keep flying.
+* The direct methods (`arm()`, `move_to()`, `hover()` ...) -- still here for
+  scripts and older callers. `submit()` is a thin validating layer on top of
+  them, so both paths produce the same motion and the same log lines.
 
 Why every command method carries a `# PHASE-1 HOOK:` comment: this class is the
 seam where the real vehicle gets plugged in. Each public command is shaped like
@@ -31,7 +43,7 @@ Link convention (motion_engine/README.md, "Our split"):
   `/fmu/in/trajectory_setpoint` paired with `/fmu/in/offboard_control_mode`.
 * Pose/state comes *back* over uXRCE-DDS (`/fmu/out/vehicle_local_position`).
 
-Coordinate frame (shared with the rest of `mission/`): local metres, origin =
+Coordinate frame (INTEGRATION_README.md §4): local metres, origin =
 dock / cart pad at launch, `x` = east, `y` = north, `z` = altitude **up**
 (positive). Yaw in degrees, 0 = +x (east), counter-clockwise positive -- i.e.
 ENU. PX4's local frame is **NED** `(north, east, down)`, so on the way out
@@ -50,16 +62,42 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-if TYPE_CHECKING:  # pragma: no cover -- type hint only, see note below.
-    # Imported for typing only: MotionStub never constructs a logger, it just
-    # calls `.log(...)` on whatever it is handed (or nothing, if None). Keeping
-    # the import out of runtime means motion_engine/ does not hard-depend on
-    # mission/ existing, and there is no import cycle when
-    # mission/state_machine.py imports this module.
-    from mission.logging_format import Phase0Logger
+try:
+    from motion_engine.contracts import (
+        CONTRACT_KINDS,
+        LANDING_KINDS,
+        Command,
+        CommandAck,
+        CommandStatus,
+        LogSink,
+        MotionCommandType,
+        Pose,
+        Reason,
+        VehicleFeedback,
+    )
+except ModuleNotFoundError:  # pragma: no cover -- only motion_engine/ on sys.path
+    from contracts import (  # type: ignore[no-redef]
+        CONTRACT_KINDS,
+        LANDING_KINDS,
+        Command,
+        CommandAck,
+        CommandStatus,
+        LogSink,
+        MotionCommandType,
+        Pose,
+        Reason,
+        VehicleFeedback,
+    )
+
+# `Pose` and `MotionCommandType` moved to contracts.py (they are part of the
+# shared contract); they are re-exported here so existing
+# `from motion_engine.motion_stubs import Pose` imports keep working.
+__all__ = [
+    "GROUND_Z_M", "AIRBORNE_THRESHOLD_M", "Pose", "MotionCommandType",
+    "MotionCommand", "MotionLimits", "MotionStub", "wrap_180", "wrap_360",
+]
 
 
 #: Local-frame altitude of the ground / dock pad. The origin *is* the dock pad
@@ -71,9 +109,8 @@ GROUND_Z_M: float = 0.0
 #: pad with a sliver of numeric noise does not read as flying.
 AIRBORNE_THRESHOLD_M: float = 0.05
 
-#: Log module name. A plain string rather than `mission.logging_format.Module`
-#: so this file has no runtime dependency on mission/ (Module is a `str` Enum,
-#: so "MOTION" == Module.MOTION either way).
+#: Log module name. A plain string so this file has no runtime dependency on
+#: the shared logger (planned for `state_machine/logging_format.py`).
 _LOG_MODULE: str = "MOTION"
 
 #: Slack on the "remaining error fits in one step -> snap" test. Without it,
@@ -100,52 +137,6 @@ def wrap_180(deg: float) -> float:
     return 180.0 if out == -180.0 else out
 
 
-@dataclass(frozen=True)
-class Pose:
-    """Position (m, local ENU, z up) plus heading (deg, 0 = east, CCW +).
-
-    Frozen on purpose: `MotionStub.pose` hands this out to the state machine
-    and the synthetic world every tick. If it were mutable, one consumer doing
-    `pose.z = 0` would silently teleport the drone for everyone else.
-    """
-
-    x: float = 0.0
-    y: float = 0.0
-    z: float = 0.0
-    yaw_deg: float = 0.0
-
-    def distance_to(self, other: "Pose") -> float:
-        """3-D Euclidean distance in metres (yaw ignored)."""
-        return math.sqrt(
-            (self.x - other.x) ** 2 + (self.y - other.y) ** 2 + (self.z - other.z) ** 2
-        )
-
-    def horizontal_distance_to(self, other: "Pose") -> float:
-        """Distance in the x/y plane only, metres."""
-        return math.hypot(self.x - other.x, self.y - other.y)
-
-    def as_tuple(self) -> Tuple[float, float, float, float]:
-        return (self.x, self.y, self.z, self.yaw_deg)
-
-
-class MotionCommandType(str, Enum):
-    """Every command the stub accepts. One-to-one with the public methods."""
-
-    ARM = "ARM"
-    DISARM = "DISARM"
-    TAKEOFF = "TAKEOFF"
-    MOVE_TO = "MOVE_TO"
-    HOVER = "HOVER"
-    SET_YAW = "SET_YAW"
-    SET_ORIENTATION = "SET_ORIENTATION"
-    TRACK_TARGET = "TRACK_TARGET"
-    GOTO_DOCK_APPROACH = "GOTO_DOCK_APPROACH"
-    DESCEND_TO_DOCK = "DESCEND_TO_DOCK"
-    LAND = "LAND"
-    EMERGENCY_LAND = "EMERGENCY_LAND"
-    STOP = "STOP"
-
-
 @dataclass
 class MotionCommand:
     """An accepted command, as recorded in `MotionStub.history`.
@@ -160,6 +151,12 @@ class MotionCommand:
     speed_mps: float
     issued_at: float
     note: str = ""
+    #: Contract command ID when issued through `submit()`, else None.
+    command_id: Optional[str] = None
+    #: True if the geofence changed the requested target (direct API only;
+    #: `submit()` rejects instead of clamping).
+    clamped: bool = False
+    requested: Optional[Pose] = None
 
 
 @dataclass
@@ -209,11 +206,19 @@ class MotionStub:
     armed, airborne disarm, emergency landing in progress). Refusals are
     logged with a `decision=` explaining why, so a mission log reads as a
     complete account of what was asked and what actually happened.
+
+    Contract usage (one coordinator tick, INTEGRATION_README.md §3):
+        ack = motion.submit(command, now_ns)     # accepted / rejected + reason
+        motion.step(0.1, now_ns=now_ns)          # exactly once per tick
+        fb = motion.feedback(now_ns)             # pose, armed/airborne, progress
+
+    Pass the coordinator's simulation clock as `clock` (e.g.
+    `contracts.SimulationClock`) so log timestamps are simulation time too.
     """
 
     def __init__(
         self,
-        logger: Optional["Phase0Logger"] = None,
+        logger: Optional[LogSink] = None,
         limits: Optional[MotionLimits] = None,
         home: Pose = Pose(0.0, 0.0, 0.0, 0.0),
         clock: Callable[[], float] = time.time,
@@ -242,6 +247,13 @@ class MotionStub:
         # each tick; MotionStub never interprets it.
         self._log_state: Optional[str] = None
         self._log_truth: Optional[Dict[str, Any]] = None
+
+        # Contract bookkeeping (submit / feedback / step(now_ns)).
+        self._now_ns: int = 0
+        self._active_contract: Optional[Command] = None
+        self._dispatching: Optional[Command] = None
+        self._seen_ids: Set[str] = set()
+        self._expired_hold: bool = False
 
     # -- read-only state ----------------------------------------------
 
@@ -291,6 +303,160 @@ class MotionStub:
         return (
             self._pose.distance_to(self._target) <= tol
             and yaw_err <= self.limits.yaw_tolerance_deg
+        )
+
+    @property
+    def grounded(self) -> bool:
+        return not self.airborne
+
+    @property
+    def landing_settled(self) -> bool:
+        """True only when a landing has actually finished on the ground.
+
+        Requires z exactly at ground (the stub snaps onto targets) *and* that
+        the last thing Motion did was a landing (or the disarm after one).
+        `at_target()` is not enough: its arrival tolerance is true 0.25 m
+        above the pad (INTEGRATION_README.md §8).
+        """
+        if abs(self._pose.z - GROUND_Z_M) > _SNAP_EPS_M or self._active is None:
+            return False
+        if self._active.type not in LANDING_KINDS | {MotionCommandType.DISARM}:
+            return False
+        return self._target is None or abs(self._target.z - GROUND_Z_M) <= _SNAP_EPS_M
+
+    # -- shared contract (INTEGRATION_README.md §3-§4) ---------------------
+
+    def submit(self, command: Command, now_ns: int) -> CommandAck:
+        """Validate and execute one coordinator command; return the ack.
+
+        Accepting replaces the active target immediately, i.e. before the
+        next `step()`. Rejecting leaves the previous command active -- the
+        coordinator must send a replacement (normally a hold), and an
+        un-renewed previous command still expires on its own.
+
+        Re-sending the active `command_id` with the same kind/target and a
+        later expiry is a renewal: acknowledged with reason `renewed`, no
+        restart and no new log line. Reusing an old ID for anything else is
+        rejected.
+
+        Unlike the direct methods, a target outside the limits is rejected
+        (`target_outside_limits`) instead of clamped: an unexpected clamp is
+        a command failure the coordinator must replan around (README §4).
+        """
+        # PHASE-1 HOOK: this is where a validated contract Command turns into
+        #   the PX4 traffic listed on each direct method below (MAVLink
+        #   COMMAND_LONG for arm/takeoff/land, XRCE /fmu/in/trajectory_setpoint
+        #   + /fmu/in/offboard_control_mode for streamed targets). The ack must
+        #   then wait for COMMAND_ACK (MAVLink) or the first matching
+        #   /fmu/out/vehicle_status / vehicle_control_mode update instead of
+        #   being immediate, and the expiry becomes the offboard stream
+        #   timeout (COM_OF_LOSS_T) on the vehicle side.
+        self._now_ns = max(self._now_ns, now_ns) if isinstance(now_ns, int) else self._now_ns
+        kind_value = getattr(command, "kind", None)
+        name = kind_value.value.lower() if isinstance(kind_value, MotionCommandType) else str(kind_value).lower()
+        cmd_id = getattr(command, "command_id", None)
+
+        def reject(reason: str, detail: Optional[str] = None) -> CommandAck:
+            self._log(name, {"command_id": cmd_id}, decision=f"rejected_{reason}")
+            return self._ack(command, False, reason, now_ns, detail)
+
+        if not isinstance(command, Command):
+            return reject(Reason.INVALID_COMMAND, "not a contracts.Command")
+        if not isinstance(now_ns, int) or isinstance(now_ns, bool):
+            return reject(Reason.INVALID_COMMAND, "now_ns must be an int")
+        problem = command.validate()
+        if problem is not None:
+            return reject(problem)
+        kind = MotionCommandType(command.kind)
+        if command.issued_ns > now_ns:
+            return reject(Reason.FUTURE_TIMESTAMP)
+        if (
+            kind != MotionCommandType.EMERGENCY_LAND
+            and command.expires_ns is not None
+            and now_ns >= command.expires_ns
+        ):
+            return reject(Reason.COMMAND_EXPIRED)
+
+        active = self._active_contract
+        if active is not None and command.command_id == active.command_id:
+            if not command.same_request_as(active):
+                return reject(Reason.COMMAND_ID_REUSED, "same id, different request")
+            self._active_contract = command  # new expiry; no restart, no log
+            return self._ack(command, True, Reason.RENEWED, now_ns)
+        if command.command_id in self._seen_ids:
+            return reject(Reason.COMMAND_ID_REUSED)
+
+        if self._emergency:
+            if kind == MotionCommandType.EMERGENCY_LAND:
+                self._seen_ids.add(command.command_id)
+                return self._ack(command, True, Reason.ALREADY_EMERGENCY_LANDING, now_ns)
+            return reject(Reason.EMERGENCY_DESCENT_ACTIVE)
+        if not self._armed and kind not in (MotionCommandType.ARM, MotionCommandType.DISARM):
+            return reject(Reason.NOT_ARMED)
+        if kind == MotionCommandType.DISARM and self.airborne:
+            return reject(Reason.AIRBORNE)
+
+        requested = self._requested_pose(kind, command.target)
+        if requested is not None:
+            landing = kind == MotionCommandType.DESCEND_TO_DOCK
+            _, clamped = self._clamp(requested, landing=landing)
+            if clamped:
+                return reject(Reason.TARGET_OUTSIDE_LIMITS)
+
+        self._seen_ids.add(command.command_id)
+        self._dispatching = command
+        try:
+            ok = self._dispatch(kind, command.target)
+        finally:
+            self._dispatching = None
+        if not ok:  # pragma: no cover -- every refusal is pre-checked above
+            return self._ack(command, False, Reason.INVALID_COMMAND, now_ns, "refused by stub")
+        if command.max_horizontal_speed_mps is not None:
+            self._h_speed = min(self._h_speed, command.max_horizontal_speed_mps)
+        if command.max_vertical_speed_mps is not None:
+            self._v_speed = min(self._v_speed, command.max_vertical_speed_mps)
+        self._active_contract = command
+        return self._ack(command, True, Reason.ACCEPTED, now_ns)
+
+    def feedback(self, now_ns: Optional[int] = None) -> VehicleFeedback:
+        """The `vehicle` snapshot section. Read-only: never changes state."""
+        # PHASE-1 HOOK: on hardware every field here is read, not computed:
+        #   pose from XRCE /fmu/out/vehicle_local_position (NED -> ENU as in
+        #   step()), armed from /fmu/out/vehicle_status.arming_state, grounded
+        #   and landing_settled from /fmu/out/vehicle_land_detected (landed,
+        #   maybe_landed), and `valid` from xy_valid / z_valid plus message age.
+        t = self._target
+        p = self._pose
+        if self._emergency:
+            status = CommandStatus.EMERGENCY_DESCENT
+        elif self._expired_hold:
+            status = CommandStatus.EXPIRED_HOLD
+        elif self.landing_settled:
+            status = CommandStatus.LANDED
+        elif t is None:
+            status = CommandStatus.NONE
+        elif self.at_target():
+            status = CommandStatus.ARRIVED
+        else:
+            status = CommandStatus.IN_PROGRESS
+        active = self._active
+        return VehicleFeedback(
+            timestamp_ns=self._now_ns if now_ns is None else now_ns,
+            pose=p,
+            armed=self._armed,
+            airborne=self.airborne,
+            grounded=self.grounded,
+            emergency_descent=self._emergency,
+            landing_settled=self.landing_settled,
+            active_command_id=active.command_id if active is not None else None,
+            active_kind=active.type.value if active is not None else None,
+            target=t,
+            status=status,
+            arrived=self.at_target(),
+            distance_to_target_m=p.distance_to(t) if t is not None else None,
+            horizontal_error_m=p.horizontal_distance_to(t) if t is not None else None,
+            vertical_error_m=(t.z - p.z) if t is not None else None,
+            yaw_error_deg=abs(wrap_180(t.yaw_deg - p.yaw_deg)) if t is not None else None,
         )
 
     # -- arming ---------------------------------------------------------
@@ -467,7 +633,7 @@ class MotionStub:
 
         `bearing_deg` is in the *world* (local ENU) yaw convention -- 0 = east,
         CCW positive -- measured from the drone's current position, which is
-        how `mission/synthetic_world.py` reports it. The new target is the
+        how the synthetic world fixtures report tracking geometry. The new target is the
         point `distance_m - standoff_m` along that bearing, facing the bird.
         If the bird is already closer than the standoff, that distance is
         negative and the drone backs away to restore it. `altitude_m=None`
@@ -508,6 +674,37 @@ class MotionStub:
         self._accept(
             MotionCommandType.TRACK_TARGET, target, self._h_speed, "track_target",
             fields, clamped=clamped, requested=requested, decision=decision,
+        )
+        return True
+
+    def track_position(
+        self, x: float, y: float, z: float, yaw_deg: Optional[float] = None
+    ) -> bool:
+        """Follow a tracking target that Navigation already computed.
+
+        Under INTEGRATION_README.md, Navigation turns bird geometry into a
+        standoff pose; Motion just flies it. Same kinematics as `move_to`,
+        recorded as TRACK_TARGET so the log shows *why* the drone moved.
+        `track_target()` (bearing/distance in) is kept for older callers.
+        """
+        yaw = (
+            (self._target.yaw_deg if self._target is not None else self._pose.yaw_deg)
+            if yaw_deg is None else wrap_360(yaw_deg)
+        )
+        fields = {"x": x, "y": y, "z": z, "yaw": yaw}
+        if not self._precheck("track_target", fields):
+            return False
+        requested = Pose(x, y, z, yaw)
+        target, clamped = self._clamp(requested)
+        # PHASE-1 HOOK: streamed every tick -> XRCE /fmu/in/trajectory_setpoint
+        #   + /fmu/in/offboard_control_mode (position=True), same as
+        #   track_target(). NED conversion: position = [target.y, target.x,
+        #   -target.z], yaw = radians(wrap_180(90 - target.yaw_deg)).
+        self._set_target(target, self.limits.max_horizontal_speed_mps, self.limits.max_vertical_speed_mps)
+        self._accept(
+            MotionCommandType.TRACK_TARGET, target, self._h_speed, "track_target",
+            {"x": target.x, "y": target.y, "z": target.z, "yaw": target.yaw_deg},
+            clamped=clamped, requested=requested,
         )
         return True
 
@@ -609,7 +806,7 @@ class MotionStub:
 
     # -- integration ----------------------------------------------------
 
-    def step(self, dt: float) -> Pose:
+    def step(self, dt: float, now_ns: Optional[int] = None) -> Pose:
         """Advance the synthetic pose `dt` seconds toward the target.
 
         Horizontal and vertical motion are capped independently; yaw turns
@@ -617,6 +814,11 @@ class MotionStub:
         onto its target when the remaining error fits inside one step, so
         arrival is exact rather than asymptotic. Does not log per tick --
         only the one-off `arrived(...)` and emergency auto-disarm.
+
+        `now_ns` (simulation time of this tick) enables command expiry: if
+        the active contract command has expired, it is replaced by a hold at
+        the current pose *before* moving (INTEGRATION_README.md §3). Emergency
+        descent never expires.
         """
         # PHASE-1 HOOK: on hardware nothing is integrated here. Pose comes from
         #   XRCE /fmu/out/vehicle_local_position (NED): x = msg.y (east),
@@ -627,6 +829,9 @@ class MotionStub:
         #   step() becomes "read latest pose, check arrival"; the setpoint
         #   stream (trajectory_setpoint + offboard_control_mode) is re-published
         #   here at the control rate if the active command is an offboard one.
+        if now_ns is not None:
+            self._now_ns = max(self._now_ns, now_ns)
+            self._expire_if_needed(now_ns)
         if dt <= 0.0 or self._target is None or not self._armed:
             return self._pose
 
@@ -676,6 +881,96 @@ class MotionStub:
         return self._pose
 
     # -- internals ------------------------------------------------------
+
+    def _requested_pose(self, kind: MotionCommandType, target: Optional[Pose]) -> Optional[Pose]:
+        """The pose a contract command would ask for, before clamping."""
+        if target is None:
+            return None
+        if kind == MotionCommandType.TAKEOFF:
+            return Pose(self._pose.x, self._pose.y, target.z, self._pose.yaw_deg)
+        if kind in (
+            MotionCommandType.MOVE_TO,
+            MotionCommandType.TRACK_TARGET,
+            MotionCommandType.GOTO_DOCK_APPROACH,
+            MotionCommandType.DESCEND_TO_DOCK,
+        ):
+            return target
+        return None  # SET_YAW: yaw only, nothing to clamp
+
+    def _dispatch(self, kind: MotionCommandType, t: Optional[Pose]) -> bool:
+        """Route a validated contract command to the matching direct method."""
+        K = MotionCommandType
+        if kind == K.ARM:
+            return self.arm()
+        if kind == K.DISARM:
+            return self.disarm()
+        if kind == K.TAKEOFF:
+            return self.takeoff(t.z)
+        if kind == K.MOVE_TO:
+            return self.move_to(t.x, t.y, t.z, yaw_deg=t.yaw_deg)
+        if kind == K.TRACK_TARGET:
+            return self.track_position(t.x, t.y, t.z, yaw_deg=t.yaw_deg)
+        if kind == K.SET_YAW:
+            return self.set_yaw(t.yaw_deg)
+        if kind == K.HOVER:
+            return self.hover()
+        if kind == K.STOP:
+            return self.stop()
+        if kind == K.GOTO_DOCK_APPROACH:
+            # The contract carries the approach point itself; the direct
+            # method wants pad + height. Pad and ground are z = 0 here.
+            return self.goto_dock_approach(
+                Pose(t.x, t.y, GROUND_Z_M, t.yaw_deg), approach_altitude_m=t.z - GROUND_Z_M
+            )
+        if kind == K.DESCEND_TO_DOCK:
+            return self.descend_to_dock(t)
+        if kind == K.LAND:
+            return self.land()
+        if kind == K.EMERGENCY_LAND:
+            return self.emergency_land()
+        return False  # pragma: no cover -- CONTRACT_KINDS is exhaustive
+
+    def _expire_if_needed(self, now_ns: int) -> None:
+        cmd = self._active_contract
+        if (
+            cmd is None
+            or cmd.expires_ns is None
+            or MotionCommandType(cmd.kind) == MotionCommandType.EMERGENCY_LAND
+            or now_ns < cmd.expires_ns
+        ):
+            return
+        self._active_contract = None
+        if not self._armed or self._target is None:
+            return
+        # Hold exactly where we are, at the current speed caps, before this
+        # tick's movement -- the expired target must not keep pulling.
+        here = self._pose
+        self._set_target(here, self._h_speed, self._v_speed)
+        self._arrival_logged = True
+        rec = MotionCommand(MotionCommandType.HOVER, here, 0.0, self._clock(), note="expired_hold")
+        self._active = rec
+        self._history.append(rec)
+        self._expired_hold = True
+        self._log(
+            "command_expired",
+            {"command_id": cmd.command_id, "x": here.x, "y": here.y, "z": here.z},
+            decision="hold_in_place",
+        )
+
+    def _ack(
+        self, command: Any, accepted: bool, reason: str, now_ns: Any, detail: Optional[str] = None
+    ) -> CommandAck:
+        kind = getattr(command, "kind", None)
+        active = self._active
+        return CommandAck(
+            command_id=str(getattr(command, "command_id", "")),
+            accepted=accepted,
+            reason=reason,
+            timestamp_ns=now_ns if isinstance(now_ns, int) and not isinstance(now_ns, bool) else self._now_ns,
+            kind=kind.value if isinstance(kind, MotionCommandType) else (str(kind) if kind is not None else None),
+            active_command_id=active.command_id if active is not None else None,
+            detail=detail,
+        )
 
     def _hold(self, kind: MotionCommandType, name: str) -> bool:
         if not self._precheck(name, {}):
@@ -757,9 +1052,21 @@ class MotionStub:
         requested: Optional[Pose] = None,
         decision: Optional[str] = None,
     ) -> None:
-        cmd = MotionCommand(kind, target, speed, self._clock(), note=name)
+        contract = self._dispatching
+        cmd = MotionCommand(
+            kind, target, speed, self._clock(), note=name,
+            command_id=contract.command_id if contract is not None else None,
+            clamped=clamped, requested=requested if clamped else None,
+        )
         self._active = cmd
         self._history.append(cmd)
+        self._expired_hold = False
+        if contract is None:
+            # A direct call supersedes whatever the coordinator last sent.
+            self._active_contract = None
+        else:
+            fields = dict(fields)
+            fields["command_id"] = contract.command_id
         if clamped and requested is not None:
             fields = dict(fields)
             fields.update({"req_x": requested.x, "req_y": requested.y, "req_z": requested.z})
