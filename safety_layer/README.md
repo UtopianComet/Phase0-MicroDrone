@@ -1,34 +1,77 @@
 # Safety Layer — Phase 0
 
-[Phase 0 scope: Start Here](../START_HERE.md)
+[Phase 0 scope: Start Here](../START_HERE.md) ·
+[Integration contract](../INTEGRATION_README.md)
 
-## Purpose
+## What this does
 
-Enforce application-level constraints on simulated mission commands from the first flight milestone. PX4's own failsafes remain active. Simulation tests demonstrate behavior under specified conditions; they do not establish hardware safety.
+Safety is the referee. Each tick it says what the drone is allowed to do.
+Nothing moves unless Safety permits it.
 
-Motion/navigation leads implementation. CV publishes observations only; simulation supplies failure fixtures, and the safety layer owns all safety decisions.
+Safety does **not** move the drone, choose mission states, or decide when to
+come home. It grants or refuses permission, and always says why.
 
-## Inputs and outputs
+Phase 0 is fully synthetic — no drone, no PX4, no hardware. Passing tests show
+the software behaves as specified, not that a real drone would be safe.
 
-- Inputs: vehicle-state freshness, requested targets, configured limits/geofence, simulated battery status, operator abort, and docking/vision validity.
-- Outputs: permitted action or override, reason, timestamp, and event logs.
-- All mission and docking targets pass through enforcement before being sent to PX4.
-- Missing or stale required inputs must have explicit behavior.
+## The two checks
 
-## First tasks
+| Function | Question it answers |
+|---|---|
+| `assess(snapshot, now_ns)` | Is `launch` / `tracking` / `approach` / `descent` / `hold` allowed right now? |
+| `check_command(command, assessment, now_ns)` | Is this specific order safe to send? |
 
-1. Define position/velocity limits, geofence, and state/command timeouts.
-2. Define controlled abort behavior for each flight state.
-3. Reject or constrain invalid targets before transmission.
-4. Inject stale telemetry, command loss, and low battery in simulation.
-5. Test missing or stale synthetic inputs during docking with the docking team.
+An unsafe order gets a **replacement** (hold, or emergency land), never a
+silent refusal — withholding a command would leave the drone flying toward its
+old target. These run at steps 3 and 7 of each tick.
 
-Distinguish a controlled abort (such as hold or land under specified conditions) from motor termination. Document when each action is available. Avoid blanket rules that disable stabilization while demanding a controlled landing.
+## How decisions are made
 
-Use explicitly labeled synthetic inputs for observation-related tests. A CV stub does not demonstrate real-world detection capability.
+First level that applies wins:
 
-## Acceptance evidence
+1. **Emergency** — airborne with critical battery, unknown position/battery,
+   lost signal, or bad weather → land in place, replace any order.
+2. **Abort** — operator stop or rejected command → cancel target; hold still allowed.
+3. **Restrictions** — block only what the hazard affects:
 
-Each scenario records the input condition, expected response, observed response, and timing. Agree thresholds and pass/fail criteria before testing. Verify that ordinary mission commands cannot override an active constraint.
+   | Hazard | Blocks |
+   |---|---|
+   | Low battery (≤20%) | launch, tracking |
+   | People nearby / cart moving | launch, tracking, approach, descent |
+   | Camera failure | launch, tracking |
+   | Missing pad data | approach, descent |
+   | Bad alignment | descent |
+   | Unknown position | everything |
 
-Implementation files and run commands have not yet been created.
+4. **Proceed** — permit the rest.
+
+**Anything unknown counts as unsafe.** Missing, invalid, or stale (>0.5 s) data
+blocks whatever depends on it. A grounded emergency inhibits launch rather than
+landing; holding survives an abort, because holding is how the drone stops.
+
+## Files
+
+`config.py` (all threshold numbers) · `safety_policy.py` (situation check) ·
+`command_check.py` (order check) · `safety_decision.py` (original placeholder)
+
+
+```
+python -m unittest tests.test_safety_policy tests.test_command_check tests.test_safety_decision -v
+```
+
+32 tests. Simulation time is passed in as `now_ns`; nothing here reads the real
+clock.
+
+## Safety owns
+
+Battery thresholds, freshness, timeouts, and movement limits. Docking asks
+whether to return; Safety decides whether returning is permitted.
+
+## Not done yet
+
+- **Field names unconfirmed** — taken from Integration README Section 4; the
+  shared contracts module doesn't exist. Wrong names mean `assess()` reads empty
+  sections and blocks everything. Needs the state machine team to confirm.
+- Timers (launch, docking, 60 s return deadline) need coordinator-tracked time.
+- Logging not wired up; weather strings are a guess; `Command` is provisional,
+  since Motion already has `MotionCommand` with different fields.

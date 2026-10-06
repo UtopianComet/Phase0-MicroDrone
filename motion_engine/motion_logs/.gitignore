@@ -1,0 +1,4 @@
+# Output of motion_engine/synthetic/generate_motion_data.py.
+# Keep the folder in git, but not the generated files -- regenerate them instead.
+*
+!.gitignore

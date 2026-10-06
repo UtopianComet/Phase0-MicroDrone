@@ -2,8 +2,11 @@
 
 The stub is kinematic on purpose, so these tests can be exact about timing:
 at a 5 m/s horizontal cap, 20 m takes 4 s -- not "roughly". Logging is checked
-against the real `mission.logging_format.Phase0Logger` with a fake clock, since
-the log lines are part of the contract the mission layer relies on.
+against `contracts.MemoryLogSink` with a fake clock: the records (module,
+event, fields, state, truth, decision) are what the coordinator relies on.
+Text rendering belongs to the shared logger (planned for
+`state_machine/logging_format.py`), so it is not tested here. The
+command/ack/feedback contract has its own file, test_motion_contract.py.
 """
 
 import ast
@@ -18,7 +21,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest
 
-from mission.logging_format import Phase0Logger
+from motion_engine.contracts import MemoryLogSink
 from motion_engine.motion_stubs import (
     MotionCommandType,
     MotionLimits,
@@ -44,8 +47,8 @@ def clock():
 
 
 @pytest.fixture
-def logger(clock):
-    return Phase0Logger(clock=clock)
+def logger():
+    return MemoryLogSink()
 
 
 @pytest.fixture
@@ -254,7 +257,7 @@ def test_unclamped_command_has_no_clamp_decision(motion, logger):
     rec = motion_records(logger, "move_to")[-1]
     assert rec.decision is None
     assert rec.fields == {"x": 10.0, "y": 5.0, "z": 12.0, "yaw": 90.0}
-    assert rec.to_text().endswith("MOTION: move_to(x=10.0, y=5.0, z=12.0, yaw=90.0)")
+    assert rec.module == "MOTION" and rec.t == motion._clock()
 
 
 # -- arming rules ---------------------------------------------------------------
@@ -501,6 +504,7 @@ def test_every_public_command_has_phase1_hook():
         "arm", "disarm", "takeoff", "move_to", "hover", "stop", "set_yaw",
         "set_orientation", "track_target", "goto_dock_approach", "descend_to_dock",
         "land", "emergency_land", "step",
+        "submit", "feedback", "track_position",
     }
     assert expected <= names
     lines = source.splitlines()
