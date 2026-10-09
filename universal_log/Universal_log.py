@@ -38,7 +38,7 @@ class UniversalLog:
         logger.propagate = False
         formatter = logging.Formatter("%(message)s")
         if not any(isinstance(handler, logging.FileHandler) for handler in logger.handlers):
-            run_id = datetime.now().strftime("%Y / %m / %d_%f")
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             file_handler = logging.FileHandler(
                 Path(__file__).with_name(f"logged_states_{run_id}.log"),
                 mode="x",
@@ -60,9 +60,9 @@ class UniversalLog:
 
         logger.log(level, message)
 
-
-"""def main(): 
-    print_to_terminal = False
+"""
+def main():
+    print_to_terminal = True
     test_file = Path(__file__).with_name("test_states.json")
     with test_file.open(encoding="utf-8") as json_file:
         test_entries = json.load(json_file)
@@ -72,5 +72,4 @@ class UniversalLog:
 
 
 if __name__ == "__main__":
-    main()
-"""
+    main()"""

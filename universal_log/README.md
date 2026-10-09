@@ -67,6 +67,14 @@ UniversalLog(
 )
 ```
 
+To run the bundled sample entries from the project root:
+
+```powershell
+python .\universal_log\Universal_log.py
+```
+
+The sample includes every supported state, an unknown state, nested and empty details, and an entry that relies on default timestamp and details values.
+
 This will:
 
 - validate the input as a JSON object

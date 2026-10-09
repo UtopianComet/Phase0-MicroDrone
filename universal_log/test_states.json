@@ -40,5 +40,66 @@
     "Details": {
       "reason": "verify unknown-state error level"
     }
+  },
+  {
+    "Timestamp": "2026-09-29T10:00:25.000Z",
+    "State": "HOVERING",
+    "Details": {
+      "altitude_m": 1.5,
+      "vertical_speed_mps": 0.0,
+      "hold_seconds": 12
+    }
+  },
+  {
+    "Timestamp": "2026-09-29T10:00:30.000Z",
+    "State": "DOCKING_INIT",
+    "Details": {
+      "target_pad": "pad-A",
+      "approach_side": "north",
+      "sensors_ready": true
+    }
+  },
+  {
+    "Timestamp": "2026-09-29T10:00:35.000Z",
+    "State": "DOCKED",
+    "Details": {
+      "contact_confirmed": true,
+      "charging": true,
+      "battery_percent": 100
+    }
+  },
+  {
+    "Timestamp": "2026-09-29T10:00:40.000Z",
+    "State": "EMERGENCY_LAND",
+    "Details": {
+      "reason": "low battery threshold",
+      "battery_percent": 5,
+      "landing_site": {
+        "x": 2.1,
+        "y": -0.7,
+        "z": 0.0
+      }
+    }
+  },
+  {
+    "Timestamp": "2026-09-29T10:00:45.000Z",
+    "State": "TRACKING",
+    "Details": {
+      "position_m": {
+        "x": -3.2,
+        "y": 0.0,
+        "z": 4.8
+      },
+      "obstacle_detected": false,
+      "sensor_readings": [0.4, 0.6, 0.9]
+    }
+  },
+  {
+    "Timestamp": "2026-09-29T10:00:50.000Z",
+    "State": "HOVERING",
+    "Details": {}
+  },
+  {
+    "State": "IDLE"
   }
 ]
