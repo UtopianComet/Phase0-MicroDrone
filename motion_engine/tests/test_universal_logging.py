@@ -1,4 +1,4 @@
-"""MotionStub logging through the shared UniversalLog (universal_log/).
+"""Motion's logging: the shared UniversalLog adapter and integrated runs.
 
 `UniversalLogSink` adapts Motion's `LogSink` calls to UniversalLog's
 `{"State", "Details"}` records. These tests check that:
@@ -9,18 +9,15 @@
   coordinator's mission state, into the same run file CV uses,
 * mission-state enums, missing state and non-JSON values are handled
   instead of raising inside the mission loop.
+
+Passing this logger into the integrated loop (`state_machine/run_loop.py`)
+is the State Machine team's change; its tests travel with that request.
 """
 
 import json
 import logging
 import math
-import sys
 from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 import pytest
 
@@ -32,12 +29,10 @@ from motion_engine.contracts import (
     SimulationClock,
 )
 from motion_engine.motion_stubs import MotionStub
+from motion_engine.tests.motion_rig import DT, REPO_ROOT, VALIDITY_NS
 from motion_engine.universal_logging import UniversalLogSink, log_entry
 from state_machine.state_machine import State
 from universal_log import Universal_log as universal_log_module
-
-DT = 0.1
-VALIDITY_NS = 200_000_000
 
 
 def _drive(logger, state=None):
@@ -201,7 +196,7 @@ def test_non_json_values_do_not_break_the_logger(universal_log_file):
 
 
 def test_motion_and_cv_share_one_run_file(universal_log_file):
-    path = _REPO_ROOT / "cv" / "universal_logging.py"
+    path = REPO_ROOT / "cv" / "universal_logging.py"
     spec = spec_from_file_location("_test_cv_universal_logging", path)
     cv_logging = module_from_spec(spec)
     spec.loader.exec_module(cv_logging)
