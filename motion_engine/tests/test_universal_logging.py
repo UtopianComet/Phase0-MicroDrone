@@ -34,6 +34,7 @@ from motion_engine.contracts import (
 from motion_engine.motion_stubs import MotionStub
 from motion_engine.universal_logging import UniversalLogSink, log_entry
 from state_machine.state_machine import State
+from universal_log import Universal_log as universal_log_module
 
 DT = 0.1
 VALIDITY_NS = 200_000_000
@@ -137,6 +138,28 @@ def test_real_universal_log_writes_one_json_line_per_record(universal_log_file):
         assert details["decision"] == entry.decision
         assert details["synthetic_truth"] == {"bird_x": 4.0}
         assert details["t"] == pytest.approx(entry.t)
+
+
+def test_real_log_file_is_created_under_logs_directory(tmp_path, monkeypatch):
+    logger = logging.getLogger("universal_log")
+    saved = (logger.handlers[:], logger.level, logger.propagate,
+             getattr(logger, "_universal_console_handler", None))
+    logger.handlers = []
+    logger._universal_console_handler = None
+    monkeypatch.setattr(universal_log_module, "__file__", str(tmp_path / "Universal_log.py"))
+    try:
+        universal_log_module.UniversalLog({"State": "IDLE", "Details": {}})
+        handler = next(h for h in logger.handlers if isinstance(h, logging.FileHandler))
+        handler.flush()
+        path = Path(handler.baseFilename)
+        assert path.parent == tmp_path / "logs"
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+    finally:
+        for handler in logger.handlers:
+            if handler not in saved[0]:
+                handler.close()
+        logger.handlers, level, logger.propagate, logger._universal_console_handler = saved
+        logger.setLevel(level)
 
 
 def test_state_enum_is_written_as_its_value(universal_log_file):

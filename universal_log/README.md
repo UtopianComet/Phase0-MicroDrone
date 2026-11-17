@@ -75,8 +75,11 @@ When an application creates a `UniversalLog` entry, the logger will:
 
 - validate the input as a JSON object
 - ensure `Details` is a dictionary
-- write the log entry to a file named like `logged_states_<date>_<time>.log`
+- write the log entry to `universal_log/logs/logged_states_<date>_<time>.log`
 - print the message to the terminal if `print_to_terminal=True`
+
+The `logs` directory is created automatically when the first log entry is
+written. Its generated log files are ignored by Git.
 
 ## Error handling
 
